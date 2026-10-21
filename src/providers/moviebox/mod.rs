@@ -283,7 +283,10 @@ impl MovieBoxClient {
         }
 
         if items.is_empty() {
-            match self.get_resources(subject_id, season, episode, 1, None, 10).await {
+            match self
+                .get_resources(subject_id, season, episode, 1, None, 10)
+                .await
+            {
                 Ok(payload) => {
                     if let Some(list) = payload.get("list").and_then(|l| l.as_array()) {
                         items.extend(list.iter().cloned());
