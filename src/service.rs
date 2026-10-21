@@ -219,9 +219,8 @@ impl MovieBoxService {
                 let client = &self.client;
                 sibling_futs.push(async move {
                     tokio::time::timeout(std::time::Duration::from_secs(6), async move {
-                        let page = if episode > 0 { (episode - 1) / 20 + 1 } else { 1 };
                         if let Ok((items, _)) =
-                            client.fetch_resource_page(sib, season, episode, 0, page).await
+                            client.fetch_resource_page(sib, season, episode, 0, 1).await
                         {
                             let matched_item = find_matching_resource_item(&items, season, episode);
                             if let Some(item) = matched_item {

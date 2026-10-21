@@ -64,22 +64,18 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
     ) -> Result<Vec<crate::providers::models::Release>, ProviderError> {
         let (play_info_res, resources_res) = tokio::join!(
             self.get_play_info(id, season, episode),
-            self.get_resources(
-                id,
-                season,
-                episode,
-                if episode > 0 {
-                    (episode - 1) / 20 + 1
-                } else {
-                    1
-                },
-                None,
-                20,
-            )
+            self.fetch_resource_pack(id, season, episode),
         );
 
         let mut releases = Vec::new();
         let mut seen_urls = std::collections::HashSet::new();
+
+        if let Err(err) = &play_info_res {
+            log::warn!("moviebox: play info fetch failed for {id} ({season}x{episode}): {err}");
+        }
+        if let Err(err) = &resources_res {
+            log::warn!("moviebox: resource pack fetch failed for {id} ({season}x{episode}): {err}");
+        }
 
         if let Ok(json) = play_info_res {
             for rel in adapt::moviebox_play_info_json_to_releases(
@@ -98,8 +94,8 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
             }
         }
 
-        if let Ok(res_json) = resources_res {
-            for rel in adapt::moviebox_resource_json_to_releases(&res_json) {
+        if let Ok(resource_items) = resources_res {
+            for rel in adapt::moviebox_resource_json_to_releases(&Value::Array(resource_items)) {
                 if let Some(url) = rel.direct_url() {
                     let base = url.split('?').next().unwrap_or(url).to_string();
                     if !base.is_empty() && seen_urls.contains(&base) {
@@ -263,12 +259,101 @@ impl MovieBoxClient {
         Ok((items, pager))
     }
 
+    pub async fn fetch_resource_pack(
+        &self,
+        subject_id: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Vec<Value>, ScraperError> {
+        let (low, sd, hd, fhd) = tokio::join!(
+            self.fetch_resolution_pages(subject_id, season, episode, 360),
+            self.fetch_resolution_pages(subject_id, season, episode, 480),
+            self.fetch_resolution_pages(subject_id, season, episode, 720),
+            self.fetch_resolution_pages(subject_id, season, episode, 1080),
+        );
+
+        let mut items = Vec::new();
+        let mut first_error = None;
+        for result in [low, sd, hd, fhd] {
+            match result {
+                Ok(mut page_items) => items.append(&mut page_items),
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+        }
+
+        if items.is_empty() {
+            match self.get_resources(subject_id, season, episode, 1, None, 10).await {
+                Ok(payload) => {
+                    if let Some(list) = payload.get("list").and_then(|l| l.as_array()) {
+                        items.extend(list.iter().cloned());
+                    }
+                }
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+        }
+
+        if items.is_empty() {
+            if let Some(err) = first_error {
+                return Err(err);
+            }
+        }
+
+        let mut seen_ids = std::collections::HashSet::new();
+        items.retain(|item| {
+            let key = item
+                .get("resourceId")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| item.to_string());
+            seen_ids.insert(key)
+        });
+
+        items.sort_by(|left, right| {
+            right
+                .get("resolution")
+                .and_then(|v| v.as_u64())
+                .cmp(&left.get("resolution").and_then(|v| v.as_u64()))
+        });
+
+        Ok(items)
+    }
+
+    async fn fetch_resolution_pages(
+        &self,
+        subject_id: &str,
+        season: usize,
+        episode: usize,
+        resolution: u32,
+    ) -> Result<Vec<Value>, ScraperError> {
+        let mut items = Vec::new();
+        let mut page = 1usize;
+
+        loop {
+            let (page_items, pager) = self
+                .fetch_resource_page(subject_id, season, episode, resolution, page)
+                .await?;
+            items.extend(page_items);
+
+            let has_more = pager
+                .get("hasMore")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !has_more || page >= 100 {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(items)
+    }
+
     pub async fn fetch_collection_resolutions(
         &self,
         subject_id: &str,
     ) -> Result<Vec<u32>, ScraperError> {
         let path = format!(
-            "/wefeed-mobile-bff/subject-api/resource?subjectId={}&page=1&perPage=20",
+            "/wefeed-mobile-bff/subject-api/resource?subjectId={}&page=1&perPage=10",
             subject_id
         );
         let res = self.get(&path).await?;
@@ -333,12 +418,12 @@ pub fn resource_page_path(
 
     if season == 0 && episode == 0 {
         format!(
-            "/wefeed-mobile-bff/subject-api/resource?subjectId={}&page={}&perPage=20{}",
+            "/wefeed-mobile-bff/subject-api/resource?subjectId={}&page={}&perPage=10{}",
             subject_id, page, res_param
         )
     } else {
         format!(
-            "/wefeed-mobile-bff/subject-api/resource?subjectId={}&se={}&ep={}&page={}&perPage=20{}",
+            "/wefeed-mobile-bff/subject-api/resource?subjectId={}&se={}&ep={}&page={}&perPage=10{}",
             subject_id, season, episode, page, res_param
         )
     }
@@ -353,7 +438,7 @@ mod tests {
         let path = resource_page_path("12345", 0, 0, 0, 1);
         assert_eq!(
             path,
-            "/wefeed-mobile-bff/subject-api/resource?subjectId=12345&page=1&perPage=20"
+            "/wefeed-mobile-bff/subject-api/resource?subjectId=12345&page=1&perPage=10"
         );
     }
 
@@ -362,7 +447,7 @@ mod tests {
         let path = resource_page_path("67890", 2, 5, 0, 1);
         assert_eq!(
             path,
-            "/wefeed-mobile-bff/subject-api/resource?subjectId=67890&se=2&ep=5&page=1&perPage=20"
+            "/wefeed-mobile-bff/subject-api/resource?subjectId=67890&se=2&ep=5&page=1&perPage=10"
         );
     }
 
@@ -371,7 +456,7 @@ mod tests {
         let path = resource_page_path("67890", 1, 10, 1080, 2);
         assert_eq!(
             path,
-            "/wefeed-mobile-bff/subject-api/resource?subjectId=67890&se=1&ep=10&page=2&perPage=20&resolution=1080"
+            "/wefeed-mobile-bff/subject-api/resource?subjectId=67890&se=1&ep=10&page=2&perPage=10&resolution=1080"
         );
     }
 }

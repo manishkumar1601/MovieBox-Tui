@@ -572,14 +572,16 @@ pub fn is_deprecation_notice_url(url: &str) -> bool {
 
 fn to_dash_mpd(url_str: &str) -> Option<String> {
     let base = url_str.trim_end_matches('*').trim_end_matches('/');
-    if !base.is_empty()
-        && (base.starts_with("http://") || base.starts_with("https://"))
-        && base.contains("/dash/")
-    {
-        Some(format!("{base}/index.mpd"))
-    } else {
-        None
+    if base.is_empty() || !(base.starts_with("http://") || base.starts_with("https://")) {
+        return None;
     }
+    if base.ends_with(".mpd") {
+        return Some(base.to_string());
+    }
+    if base.contains("/dash/") {
+        return Some(format!("{base}/index.mpd"));
+    }
+    None
 }
 
 fn decode_b64_padded(mut s: String) -> Option<Vec<u8>> {
